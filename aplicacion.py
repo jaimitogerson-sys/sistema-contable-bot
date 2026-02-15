@@ -7,7 +7,7 @@ from flask import Flask, request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-app = Flask(__name__)  # CORRECTO
+app = Flask(name)  # CORRECTO
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -29,6 +29,26 @@ creds = service_account.Credentials.from_service_account_info(
 drive_service = build("drive", "v3", credentials=creds)
 archivos_vistos = set()
 
+# ---------------- MINI SCRIPT DE PRUEBA ----------------
+def prueba_drive():
+    try:
+        resultados = drive_service.files().list(
+            q=f"'{FOLDER_ID}' in parents",
+            fields="files(id, name)"
+        ).execute()
+        archivos = resultados.get("files", [])
+        if archivos:
+            print("Archivos en la carpeta:")
+            for archivo in archivos:
+                print(f"- {archivo['name']}")
+        else:
+            print("La carpeta está vacía o el bot no tiene acceso.")
+    except Exception as e:
+        print("Error al probar Drive:", e)
+
+prueba_drive()  # Ejecutar al iniciar
+
+# ---------------- HILO DE REVISIÓN ----------------
 def revisar_drive():
     while True:
         try:
@@ -36,6 +56,7 @@ def revisar_drive():
                 q=f"'{FOLDER_ID}' in parents",
                 fields="files(id, name)"
             ).execute()
+
             archivos = resultados.get("files", [])
             for archivo in archivos:
                 if archivo["id"] not in archivos_vistos:
@@ -65,5 +86,5 @@ def webhook():
             enviar_mensaje(f"Recibido: {texto}")
     return "ok"
 
-if __name__ == "__main__":  # CORRECTO
+if name == "main":  # CORRECTO
     app.run(host="0.0.0.0", port=10000)

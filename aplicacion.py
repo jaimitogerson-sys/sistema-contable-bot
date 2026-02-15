@@ -62,7 +62,6 @@ hilo_drive.daemon = True
 hilo_drive.start()
 
 # ---------------- FLASK ----------------
-
 @app.route("/", methods=["GET"])
 def home():
     return "Bot funcionando"

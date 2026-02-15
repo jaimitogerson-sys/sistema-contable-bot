@@ -60,7 +60,6 @@ def revisar_drive():
 hilo_drive = threading.Thread(target=revisar_drive)
 hilo_drive.daemon = True
 hilo_drive.start()
-
 # ---------------- FLASK ----------------
 @app.route("/", methods=["GET"])
 def home():

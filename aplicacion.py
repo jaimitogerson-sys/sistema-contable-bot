@@ -86,5 +86,5 @@ def webhook():
             enviar_mensaje(f"Recibido: {texto}")
     return "ok"
 
-f name == "main":  # <- CORRECTO
+if name == "main":  # CORRECTO
     app.run(host="0.0.0.0", port=10000)

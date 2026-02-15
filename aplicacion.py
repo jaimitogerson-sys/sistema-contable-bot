@@ -7,13 +7,11 @@ from flask import Flask, request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-app = Flask(__name__)
+app = Flask(name)  # <- CORRECTO: name
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 FOLDER_ID = os.getenv("FOLDER_ID")
-
-# Cargar credenciales de Google desde variable de entorno
 GOOGLE_CREDENTIALS = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
 
 def enviar_mensaje(texto):
@@ -32,7 +30,6 @@ creds = service_account.Credentials.from_service_account_info(
 )
 
 drive_service = build("drive", "v3", credentials=creds)
-
 archivos_vistos = set()
 
 def revisar_drive():
@@ -44,23 +41,21 @@ def revisar_drive():
             ).execute()
 
             archivos = resultados.get("files", [])
-
             for archivo in archivos:
                 if archivo["id"] not in archivos_vistos:
                     archivos_vistos.add(archivo["id"])
                     enviar_mensaje(f"📂 Nuevo archivo detectado: {archivo['name']}")
-
             time.sleep(20)
-
         except Exception as e:
             print("Error revisando Drive:", e)
             time.sleep(30)
 
-# Iniciar hilo en segundo plano
 hilo_drive = threading.Thread(target=revisar_drive)
 hilo_drive.daemon = True
 hilo_drive.start()
+
 # ---------------- FLASK ----------------
+
 @app.route("/", methods=["GET"])
 def home():
     return "Bot funcionando"
@@ -74,5 +69,5 @@ def webhook():
             enviar_mensaje(f"Recibido: {texto}")
     return "ok"
 
-if name == "main":
+if name == "main":  # <- CORRECTO
     app.run(host="0.0.0.0", port=10000)

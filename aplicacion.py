@@ -7,7 +7,7 @@ from flask import Flask, request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-app = Flask(name)
+app = Flask(__name__)
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")

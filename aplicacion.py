@@ -7,7 +7,7 @@ from flask import Flask, request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-app = Flask(__name__)  # <- CORRECTO: name
+app = Flask(__name__)  # CORRECTO
 
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -16,10 +16,7 @@ GOOGLE_CREDENTIALS = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
 
 def enviar_mensaje(texto):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    data = {
-        "chat_id": CHAT_ID,
-        "text": texto
-    }
+    data = {"chat_id": CHAT_ID, "text": texto}
     requests.post(url, data=data)
 
 # ---------------- GOOGLE DRIVE ----------------
@@ -39,7 +36,6 @@ def revisar_drive():
                 q=f"'{FOLDER_ID}' in parents",
                 fields="files(id, name)"
             ).execute()
-
             archivos = resultados.get("files", [])
             for archivo in archivos:
                 if archivo["id"] not in archivos_vistos:
@@ -69,5 +65,5 @@ def webhook():
             enviar_mensaje(f"Recibido: {texto}")
     return "ok"
 
-if name == "main":  # <- CORRECTO
+if __name__ == "__main__":  # CORRECTO
     app.run(host="0.0.0.0", port=10000)

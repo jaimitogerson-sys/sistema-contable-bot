@@ -7,6 +7,7 @@ from flask import Flask, request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+# ---------------- FLASK ----------------
 app = Flask(__name__)  # CORRECTO
 
 TOKEN = os.getenv("TOKEN")
@@ -20,7 +21,6 @@ def enviar_mensaje(texto):
     requests.post(url, data=data)
 
 # ---------------- GOOGLE DRIVE ----------------
-
 creds = service_account.Credentials.from_service_account_info(
     GOOGLE_CREDENTIALS,
     scopes=["https://www.googleapis.com/auth/drive"]
@@ -71,8 +71,7 @@ hilo_drive = threading.Thread(target=revisar_drive)
 hilo_drive.daemon = True
 hilo_drive.start()
 
-# ---------------- FLASK ----------------
-
+# ---------------- RUTAS FLASK ----------------
 @app.route("/", methods=["GET"])
 def home():
     return "Bot funcionando"
@@ -86,5 +85,6 @@ def webhook():
             enviar_mensaje(f"Recibido: {texto}")
     return "ok"
 
-if name == "main":  # CORRECTO
-    app.run(host="0.0.0.0", port=10000)
+# ---------------- INICIO DEL SERVICIO ----------------
+if __name__ == "__main__":  # CORRECTO
+    app.run(host="0.0.0.0", port=10000) 

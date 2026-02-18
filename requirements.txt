@@ -9,3 +9,5 @@ speechrecognition
 pydub
 pandas
 openpyxl 
+requests
+gunicorn

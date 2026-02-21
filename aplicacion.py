@@ -3,24 +3,26 @@ import requests
 import json
 import time
 import threading
-import psycopg2
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Flask, request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 import pandas as pd
-import openai
-from PyPDF2 import PdfReader
-import docx
+import fitz  # PyMuPDF para PDF
+import docx2txt
+import pytesseract
+from PIL import Image
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.enum.text import PP_ALIGN
 
 app = Flask(__name__)
 
 # ================== VARIABLES ==================
 TOKEN = os.getenv("TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+CHAT_ID = os.getenv("CHAT_ID")
+FOLDER_ID = os.getenv("FOLDER_ID")
 GOOGLE_CREDENTIALS = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
-OPENAI_KEY = os.getenv("OPENAI_KEY")
-openai.api_key = OPENAI_KEY
 
 # ================== TELEGRAM ==================
 def enviar_mensaje(chat_id, texto):
@@ -28,62 +30,45 @@ def enviar_mensaje(chat_id, texto):
     data = {"chat_id": chat_id, "text": texto, "parse_mode": "Markdown"}
     requests.post(url, data=data)
 
-# ================== BASE DE DATOS ==================
-def get_db():
-    return psycopg2.connect(DATABASE_URL)
-
-def crear_tablas():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS clientes (
-            id SERIAL PRIMARY KEY,
-            chat_id TEXT UNIQUE,
-            folder_id TEXT,
-            estado TEXT DEFAULT 'ACTIVO',
-            vencimiento DATE
-        );
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
-
-crear_tablas()
-
 # ================== GOOGLE DRIVE ==================
 creds = service_account.Credentials.from_service_account_info(
-    GOOGLE_CREDENTIALS,
-    scopes=["https://www.googleapis.com/auth/drive"]
+    GOOGLE_CREDENTIALS, scopes=["https://www.googleapis.com/auth/drive"]
 )
 drive_service = build("drive", "v3", credentials=creds)
-archivos_vistos = {}
+archivos_vistos = set()
 
-# ================== VERIFICAR CLIENTE ==================
-def verificar_estado(chat_id):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT estado, vencimiento FROM clientes WHERE chat_id=%s", (chat_id,))
-    resultado = cur.fetchone()
+# ================== LECTURA DE ARCHIVOS ==================
+def leer_excel(file_path):
+    return pd.read_excel(file_path)
 
-    if not resultado:
-        vencimiento = datetime.now().date() + timedelta(days=30)
-        cur.execute("INSERT INTO clientes (chat_id, vencimiento) VALUES (%s, %s)", (chat_id, vencimiento))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return True
+def leer_pdf(file_path):
+    texto = ""
+    doc = fitz.open(file_path)
+    for pagina in doc:
+        texto += pagina.get_text()
+    return texto
 
-    estado, vencimiento = resultado
-    hoy = datetime.now().date()
-    if estado != "ACTIVO" or hoy > vencimiento:
-        enviar_mensaje(chat_id, "🚫 *SERVICIO SUSPENDIDO*\nTu licencia ha vencido.\n💳 [Pagar ahora](https://tulinkdepago.com)")
-        cur.close()
-        conn.close()
-        return False
+def leer_word(file_path):
+    return docx2txt.process(file_path)
 
-    cur.close()
-    conn.close()
-    return True
+def leer_imagen(file_path):
+    return pytesseract.image_to_string(Image.open(file_path))
+
+def extraer_datos(file_path):
+    ext = file_path.split(".")[-1].lower()
+    try:
+        if ext in ["xls","xlsx"]:
+            return leer_excel(file_path)
+        elif ext == "pdf":
+            return leer_pdf(file_path)
+        elif ext in ["doc","docx"]:
+            return leer_word(file_path)
+        elif ext in ["png","jpg","jpeg"]:
+            return leer_imagen(file_path)
+        else:
+            return f"No se puede procesar: {file_path}"
+    except Exception as e:
+        return f"Error leyendo {file_path}: {e}"
 
 # ================== DRIVE FUNCIONES ==================
 def buscar_carpeta(nombre, parent_id):
@@ -112,114 +97,102 @@ def mover_archivo(file_id, carpeta_destino):
     padres_anteriores = ",".join(archivo.get("parents"))
     drive_service.files().update(fileId=file_id, addParents=carpeta_destino, removeParents=padres_anteriores, fields="id, parents").execute()
 
-# ================== LECTURA DE ARCHIVOS ==================
-def leer_archivo(file_path):
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext == ".pdf":
-        reader = PdfReader(file_path)
-        return "\n".join([p.extract_text() for p in reader.pages])
-    elif ext in [".docx", ".doc"]:
-        doc = docx.Document(file_path)
-        return "\n".join([p.text for p in doc.paragraphs])
-    elif ext in [".xlsx", ".xls"]:
-        df = pd.read_excel(file_path)
-        return df.to_string()
-    else:
-        with open(file_path, "r", errors="ignore") as f:
-            return f.read()
-
-# ================== IA ==================
-def ejecutar_instruccion_ia(prompt):
-    respuesta = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[{"role":"user","content":prompt}],
-        temperature=0.3
-    )
-    return respuesta['choices'][0]['message']['content']
-
-# ================== MONITOREO ==================
-def revisar_drive_cliente(chat_id, folder_id):
-    if chat_id not in archivos_vistos:
-        archivos_vistos[chat_id] = set()
-
+# ================== MONITOREO DRIVE ==================
+def revisar_drive():
+    global archivos_vistos
     while True:
         try:
-            if not verificar_estado(chat_id):
-                time.sleep(60)
-                continue
-
-            resultados = drive_service.files().list(q=f"'{folder_id}' in parents and trashed=false", fields="files(id,name)").execute()
+            resultados = drive_service.files().list(q=f"'{FOLDER_ID}' in parents and trashed=false", fields="files(id, name)").execute()
             archivos = resultados.get("files", [])
-            nuevos = [a for a in archivos if a["id"] not in archivos_vistos[chat_id]]
+            nuevos = [a for a in archivos if a["id"] not in archivos_vistos]
 
             if nuevos:
                 for a in nuevos:
-                    archivos_vistos[chat_id].add(a["id"])
+                    archivos_vistos.add(a["id"])
 
                 nombres = "\n".join([f"📄 {a['name']}" for a in nuevos])
-                enviar_mensaje(chat_id, f"📥 *NUEVO ARCHIVO DETECTADO*\n\n{nombres}\n\n📂 Total: {len(nuevos)} archivo(s)\n\n🤖 ¿Qué deseas que haga con estos archivos?")
-
+                enviar_mensaje(CHAT_ID,
+                    f"📥 *NUEVO ARCHIVO DETECTADO*\n\n{nombres}\n\n📂 Total: {len(nuevos)} archivo(s)\n\n🤖 Envía tu instrucción para procesarlos."
+                )
             time.sleep(20)
-
         except Exception as e:
-            print("Error:", e)
+            print("Error revisando Drive:", e)
             time.sleep(30)
 
-# ================== WEBHOOK TELEGRAM ==================
+# ================== GENERAR PRESENTACION ==================
+def generar_presentacion(resumen, path="resultados/presentacion.pptx"):
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    title = slide.shapes.title
+    title.text = "Resumen General"
+    left, top, width, height = Inches(0.5), Inches(1.5), Inches(9), Inches(5)
+    txBox = slide.shapes.add_textbox(left, top, width, height)
+    tf = txBox.text_frame
+    for r in resumen:
+        p = tf.add_paragraph()
+        p.text = str(r)
+        p.font.size = Pt(14)
+        p.alignment = PP_ALIGN.LEFT
+    prs.save(path)
+    return path
+
+# ================== EJECUTAR INSTRUCCION ==================
 @app.route(f"/{TOKEN}", methods=["POST"])
 def telegram_webhook():
     data = request.json
     if "message" in data:
-        chat_id = str(data["message"]["chat"]["id"])
-        texto = data["message"].get("text","")
-        if not verificar_estado(chat_id):
+        texto = data["message"].get("text", "").strip()
+        if not texto:
             return "ok"
 
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT folder_id FROM clientes WHERE chat_id=%s", (chat_id,))
-        resultado = cur.fetchone()
-        cur.close()
-        conn.close()
-
-        if not resultado or not resultado[0]:
-            enviar_mensaje(chat_id, "⚠ No tienes carpeta Drive vinculada.")
-            return "ok"
-
-        folder_id = resultado[0]
         inicio = time.time()
+        try:
+            # Crear carpetas
+            if "crear carpeta" in texto.lower():
+                ruta = texto.lower().replace("crear carpeta", "").strip()
+                folder_destino = crear_estructura_carpetas(ruta, FOLDER_ID)
+                tiempo = round(time.time()-inicio,2)
+                enviar_mensaje(CHAT_ID, f"✅ *FINALIZADO*\n📁 Carpeta creada: {ruta}\n⏱ Tiempo: {tiempo} segundos")
+                return "ok"
 
-        # Confirmación antes de ejecutar
-        if "crear carpeta" in texto.lower() or "mover archivo" in texto.lower() or "ejecutar" in texto.lower():
-            enviar_mensaje(chat_id, f"⚠️ *Confirmación requerida*\nDeseas que ejecute: `{texto}`?\nResponde 'SI' para continuar o 'NO' para cancelar.")
-            return "ok"
+            # Analizar archivos y ejecutar instrucción libre
+            resultados = []
+            for a_id in archivos_vistos:
+                file_meta = drive_service.files().get(fileId=a_id, fields="name").execute()
+                file_name = file_meta["name"]
+                resultados.append((file_name, extraer_datos(file_name)))
 
-        if texto.lower() == "si":
-            # Aquí IA ejecuta la instrucción real
-            resultado_ia = ejecutar_instruccion_ia(texto)
-            tiempo = round(time.time()-inicio,2)
-            enviar_mensaje(chat_id, f"✅ *INSTRUCCIÓN EJECUTADA*\n\n{resultado_ia}\n⏱ Tiempo: {tiempo} segundos")
+            # Generar Excel
+            os.makedirs("resultados", exist_ok=True)
+            path_excel = "resultados/resultado_final.xlsx"
+            with pd.ExcelWriter(path_excel) as writer:
+                for f,d in resultados:
+                    if isinstance(d,pd.DataFrame):
+                        d.to_excel(writer, sheet_name=f[:31], index=False)
+                    else:
+                        pd.DataFrame([str(d).split("\n")]).T.to_excel(writer, sheet_name=f[:31], index=False)
+
+            # Generar presentación si se pide
+            if "presentación" in texto.lower() or "ppt" in texto.lower():
+                resumen = [f"{f}: {str(d)[:100]}" for f,d in resultados]
+                path_ppt = generar_presentacion(resumen)
+
+            tiempo_total = round(time.time()-inicio,2)
+            enviar_mensaje(CHAT_ID, f"✅ Instrucción ejecutada: {texto}\n📄 Archivos procesados: {[f for f,_ in resultados]}\n⏱ Tiempo total: {tiempo_total} segundos")
+        except Exception as e:
+            enviar_mensaje(CHAT_ID, f"❌ Error ejecutando instrucción: {e}")
 
     return "ok"
 
-# ================== WEBHOOK PAGO ==================
-@app.route("/pago_webhook", methods=["POST"])
-def pago_webhook():
-    data = request.json
-    chat_id = data.get("chat_id")
-    nuevo_vencimiento = data.get("nuevo_vencimiento")
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("UPDATE clientes SET estado='ACTIVO', vencimiento=%s WHERE chat_id=%s", (nuevo_vencimiento, chat_id))
-    conn.commit()
-    cur.close()
-    conn.close()
-    enviar_mensaje(chat_id, "💳 *PAGO CONFIRMADO*\n🔓 Servicio reactivado.")
-    return "ok"
-
+# ================== HOME ==================
 @app.route("/")
 def home():
     return "Sistema activo"
+
+# ================== INICIO HILO ==================
+hilo = threading.Thread(target=revisar_drive)
+hilo.daemon = True
+hilo.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)

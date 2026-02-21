@@ -138,10 +138,14 @@ def revisar_drive():
 
                 instruccion = "Procesamiento automático"
 
+                # 🔥 MOSTRAR NOMBRES
+                nombres = "\n".join([f"📄 `{a['name']}`" for a in nuevos])
+
                 enviar_mensaje(
-                    f"📥 *Nuevos archivos detectados*\n"
-                    f"📂 Cantidad: {len(nuevos)}\n"
-                    f"⚙ Ejecutando instrucción..."
+                    f"📥 *Nuevos archivos detectados*\n\n"
+                    f"{nombres}\n\n"
+                    f"📂 Total: {len(nuevos)} archivo(s)\n"
+                    f"⚙ Iniciando procesamiento..."
                 )
 
                 ruta, tiempo_total = agente_procesador(nuevos, instruccion)
@@ -149,7 +153,7 @@ def revisar_drive():
                 enviar_mensaje(
                     f"✅ *FINALIZADO*\n\n"
                     f"⏱ Tiempo total: {tiempo_total} segundos\n"
-                    f"📁 Ubicación: {ruta}"
+                    f"📁 Ubicación: `{ruta}`"
                 )
 
             time.sleep(20)

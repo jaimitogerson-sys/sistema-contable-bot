@@ -19,6 +19,11 @@ FOLDER_ID = os.getenv("FOLDER_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 GOOGLE_CREDENTIALS = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
 
+# ================== VARIABLES GLOBALES ==================
+archivos_vistos = set()
+archivos_pendientes = []
+instruccion_pendiente = None
+
 # ================== CONEXIÓN DB ==================
 def get_db():
     return psycopg2.connect(DATABASE_URL)
@@ -40,7 +45,7 @@ def crear_tablas():
 
 crear_tablas()
 
-# ================== MENSAJES BONITOS ==================
+# ================== MENSAJES ==================
 def enviar_mensaje(texto):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     data = {
@@ -56,8 +61,6 @@ creds = service_account.Credentials.from_service_account_info(
     scopes=["https://www.googleapis.com/auth/drive"]
 )
 drive_service = build("drive", "v3", credentials=creds)
-
-archivos_vistos = set()
 
 # ================== VERIFICAR ESTADO CLIENTE ==================
 def verificar_estado():
@@ -84,8 +87,7 @@ def verificar_estado():
         enviar_mensaje(
             "🚫 *SERVICIO SUSPENDIDO*\n\n"
             "Tu licencia ha vencido.\n"
-            "💳 Realiza tu pago para reactivar.\n"
-            "👉 [Pagar ahora](https://tulinkdepago.com)"
+            "💳 Realiza tu pago para reactivar."
         )
         cur.close()
         conn.close()
@@ -95,7 +97,7 @@ def verificar_estado():
     conn.close()
     return True
 
-# ================== AGENTE INTELIGENTE ==================
+# ================== AGENTE PROCESADOR ==================
 def agente_procesador(archivos, instruccion):
     inicio = time.time()
     os.makedirs("./resultados", exist_ok=True)
@@ -104,6 +106,7 @@ def agente_procesador(archivos, instruccion):
     for archivo in archivos:
         datos.append({
             "Archivo": archivo["name"],
+            "Instrucción": instruccion,
             "Procesado": "Sí",
             "Fecha": datetime.now()
         })
@@ -116,8 +119,31 @@ def agente_procesador(archivos, instruccion):
 
     return ruta, tiempo_total
 
+# ================== EJECUTAR PROCESO ==================
+def ejecutar_proceso():
+    global archivos_pendientes
+    global instruccion_pendiente
+
+    enviar_mensaje("🚀 Ejecutando instrucción...")
+
+    ruta, tiempo_total = agente_procesador(
+        archivos_pendientes,
+        instruccion_pendiente
+    )
+
+    enviar_mensaje(
+        f"✅ *FINALIZADO*\n\n"
+        f"⏱ Tiempo total: {tiempo_total} segundos\n"
+        f"📁 Ubicación: {ruta}"
+    )
+
+    archivos_pendientes = []
+    instruccion_pendiente = None
+
 # ================== MONITOREO DRIVE ==================
 def revisar_drive():
+    global archivos_pendientes
+
     while True:
         try:
             if not verificar_estado():
@@ -136,24 +162,15 @@ def revisar_drive():
                 for a in nuevos:
                     archivos_vistos.add(a["id"])
 
-                instruccion = "Procesamiento automático"
+                archivos_pendientes = nuevos
 
-                # 🔥 MOSTRAR NOMBRES
-                nombres = "\n".join([f"📄 `{a['name']}`" for a in nuevos])
+                nombres = "\n".join([f"📄 {a['name']}" for a in nuevos])
 
                 enviar_mensaje(
-                    f"📥 *Nuevos archivos detectados*\n\n"
+                    f"📥 *NUEVO ARCHIVO DETECTADO*\n\n"
                     f"{nombres}\n\n"
-                    f"📂 Total: {len(nuevos)} archivo(s)\n"
-                    f"⚙ Iniciando procesamiento..."
-                )
-
-                ruta, tiempo_total = agente_procesador(nuevos, instruccion)
-
-                enviar_mensaje(
-                    f"✅ *FINALIZADO*\n\n"
-                    f"⏱ Tiempo total: {tiempo_total} segundos\n"
-                    f"📁 Ubicación: `{ruta}`"
+                    f"📂 Total: {len(nuevos)} archivo(s)\n\n"
+                    f"🤖 ¿Qué deseas que haga con estos archivos?"
                 )
 
             time.sleep(20)
@@ -162,42 +179,43 @@ def revisar_drive():
             print("Error:", e)
             time.sleep(30)
 
-# ================== WEBHOOK PAGO ==================
-@app.route("/pago_webhook", methods=["POST"])
-def pago_webhook():
+# ================== WEBHOOK TELEGRAM ==================
+@app.route(f"/webhook/{TOKEN}", methods=["POST"])
+def telegram_webhook():
+    global instruccion_pendiente
+
     data = request.json
-    estado_pago = data.get("estado_pago")
-    nuevo_vencimiento = data.get("nuevo_vencimiento")
 
-    if estado_pago != "aprobado":
-        return "Pago no aprobado"
+    if "message" in data:
+        texto = data["message"].get("text", "")
 
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE clientes SET estado='ACTIVO', vencimiento=%s WHERE chat_id=%s",
-        (nuevo_vencimiento, CHAT_ID)
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+        if texto.lower() in ["si", "confirmar", "confirmo"]:
+            if archivos_pendientes:
+                ejecutar_proceso()
+            return "ok"
 
-    enviar_mensaje(
-        "💳 *PAGO CONFIRMADO*\n"
-        "🔓 Servicio reactivado correctamente.\n"
-        f"📅 Nuevo vencimiento: {nuevo_vencimiento}"
-    )
+        if archivos_pendientes:
+            instruccion_pendiente = texto
+            enviar_mensaje(
+                f"⚠️ Vas a ejecutar:\n\n"
+                f"📝 {texto}\n\n"
+                f"📂 Sobre {len(archivos_pendientes)} archivo(s)\n\n"
+                f"Escribe *SI* para confirmar."
+            )
+        else:
+            enviar_mensaje("No hay archivos pendientes.")
 
     return "ok"
 
-# ================== INICIO ==================
-hilo = threading.Thread(target=revisar_drive)
-hilo.daemon = True
-hilo.start()
-
+# ================== RUTA PRINCIPAL ==================
 @app.route("/")
 def home():
     return "Sistema activo"
+
+# ================== INICIAR HILO ==================
+hilo = threading.Thread(target=revisar_drive)
+hilo.daemon = True
+hilo.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)

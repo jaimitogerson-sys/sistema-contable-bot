@@ -15,18 +15,24 @@ from PIL import Image
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.enum.text import PP_ALIGN
+import openai
 
 app = Flask(__name__)
 
 # ================== VARIABLES ==================
-TOKEN = os.getenv("TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-FOLDER_ID = os.getenv("FOLDER_ID")
+TOKEN = os.getenv("TOKEN")                   # Token Telegram
+CHAT_ID = os.getenv("CHAT_ID")               # Tu chat_id
+FOLDER_ID = os.getenv("FOLDER_ID")           # Carpeta de Drive a monitorear
 GOOGLE_CREDENTIALS = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+OPENAI_KEY = os.getenv("OPENAI_KEY")         # API Key OpenAI
+
 DESCARGA_FOLDER = "descargas"
 RESULTADOS_FOLDER = "resultados"
 os.makedirs(DESCARGA_FOLDER, exist_ok=True)
 os.makedirs(RESULTADOS_FOLDER, exist_ok=True)
+
+openai.api_key = OPENAI_KEY
+archivos_vistos = set()
 
 # ================== TELEGRAM ==================
 def enviar_mensaje(chat_id, texto):
@@ -39,9 +45,7 @@ creds = service_account.Credentials.from_service_account_info(
     GOOGLE_CREDENTIALS, scopes=["https://www.googleapis.com/auth/drive"]
 )
 drive_service = build("drive", "v3", credentials=creds)
-archivos_vistos = set()
 
-# ================== DESCARGAR ARCHIVO ==================
 def descargar_archivo(file_id, nombre_local=None):
     if not nombre_local:
         nombre_local = os.path.join(DESCARGA_FOLDER, f"{file_id}")
@@ -115,12 +119,18 @@ def mover_archivo(file_id, carpeta_destino):
     padres_anteriores = ",".join(archivo.get("parents"))
     drive_service.files().update(fileId=file_id, addParents=carpeta_destino, removeParents=padres_anteriores, fields="id, parents").execute()
 
-# ================== GENERAR PRESENTACION ==================
-def generar_presentacion(resumen, path=os.path.join(RESULTADOS_FOLDER,"presentacion.pptx")):
+# ================== GENERAR RESULTADOS ==================
+def generar_excel(dataframes, nombre="resultado.xlsx"):
+    path = os.path.join(RESULTADOS_FOLDER, nombre)
+    with pd.ExcelWriter(path) as writer:
+        for sheet_name, df in dataframes.items():
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+    return path
+
+def generar_presentacion(resumen, nombre="presentacion.pptx"):
+    path = os.path.join(RESULTADOS_FOLDER, nombre)
     prs = Presentation()
     slide = prs.slides.add_slide(prs.slide_layouts[5])
-    title = slide.shapes.title
-    title.text = "Resumen General"
     left, top, width, height = Inches(0.5), Inches(1.5), Inches(9), Inches(5)
     txBox = slide.shapes.add_textbox(left, top, width, height)
     tf = txBox.text_frame
@@ -131,6 +141,23 @@ def generar_presentacion(resumen, path=os.path.join(RESULTADOS_FOLDER,"presentac
         p.alignment = PP_ALIGN.LEFT
     prs.save(path)
     return path
+
+# ================== IA PARA INSTRUCCIONES ==================
+def procesar_instruccion_ia(instruccion, archivos):
+    archivos_info = {nombre:str(type(extraer_datos(ruta))) for nombre,ruta in archivos.items()}
+    prompt = f"""
+Tienes los archivos: {archivos_info}.
+Instrucción: {instruccion}
+
+Realiza la tarea indicada, analiza los archivos y genera resultados concretos. Indica si crear Excel, PPT u otros archivos.
+Devuelve un resumen claro y un plan de acción.
+"""
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[{"role":"user","content":prompt}],
+        temperature=0
+    )
+    return response.choices[0].message.content
 
 # ================== MONITOREO DRIVE ==================
 def revisar_drive():
@@ -144,11 +171,8 @@ def revisar_drive():
             if nuevos:
                 for a in nuevos:
                     archivos_vistos.add(a["id"])
-
                 nombres = "\n".join([f"📄 {a['name']}" for a in nuevos])
-                enviar_mensaje(CHAT_ID,
-                    f"📥 *NUEVO ARCHIVO DETECTADO*\n\n{nombres}\n\n📂 Total: {len(nuevos)} archivo(s)\n\n🤖 Envía tu instrucción para procesarlos."
-                )
+                enviar_mensaje(CHAT_ID, f"📥 *NUEVO ARCHIVO DETECTADO*\n\n{nombres}\n\n📂 Envía tu instrucción para procesarlos.")
             time.sleep(20)
         except Exception as e:
             print("Error revisando Drive:", e)
@@ -162,58 +186,43 @@ def telegram_webhook():
         texto = data["message"].get("text", "").strip()
         if not texto:
             return "ok"
-
         inicio = time.time()
         try:
             # Crear carpetas
             if "crear carpeta" in texto.lower():
-                ruta = texto.lower().replace("crear carpeta", "").strip()
-                folder_destino = crear_estructura_carpetas(ruta, FOLDER_ID)
+                ruta = texto.lower().replace("crear carpeta","").strip()
+                crear_estructura_carpetas(ruta,FOLDER_ID)
                 tiempo = round(time.time()-inicio,2)
-                enviar_mensaje(CHAT_ID, f"✅ *FINALIZADO*\n📁 Carpeta creada: {ruta}\n⏱ Tiempo: {tiempo} segundos")
+                enviar_mensaje(CHAT_ID,f"✅ Carpeta creada: {ruta}\n⏱ Tiempo: {tiempo}s")
                 return "ok"
 
-            # Procesar archivos según instrucción libre
-            resultados = []
+            # Descargar archivos
+            archivos_locales = {}
             for a_id in archivos_vistos:
                 file_meta = drive_service.files().get(fileId=a_id, fields="name").execute()
-                file_name_drive = file_meta["name"]
-                file_local = descargar_archivo(a_id, os.path.join(DESCARGA_FOLDER,file_name_drive))
-                datos = extraer_datos(file_local)
-                resultados.append((file_name_drive, datos))
+                file_name = file_meta["name"]
+                file_local = descargar_archivo(a_id, os.path.join(DESCARGA_FOLDER,file_name))
+                archivos_locales[file_name] = file_local
 
-            # Guardar Excel final
-            path_excel = os.path.join(RESULTADOS_FOLDER,"resultado_final.xlsx")
-            with pd.ExcelWriter(path_excel) as writer:
-                for f,d in resultados:
-                    if isinstance(d,pd.DataFrame):
-                        d.to_excel(writer, sheet_name=f[:31], index=False)
-                    else:
-                        pd.DataFrame([str(d).split("\n")]).T.to_excel(writer, sheet_name=f[:31], index=False)
-
-            # Generar presentación si se pide
-            if "presentación" in texto.lower() or "ppt" in texto.lower():
-                resumen = [f"{f}: {str(d)[:100]}" for f,d in resultados]
-                path_ppt = generar_presentacion(resumen)
-
+            # Procesar instrucción con IA
+            resultado_ia = procesar_instruccion_ia(texto, archivos_locales)
             tiempo_total = round(time.time()-inicio,2)
-            enviar_mensaje(CHAT_ID, f"✅ Instrucción ejecutada: {texto}\n📄 Archivos procesados: {[f for f,_ in resultados]}\n⏱ Tiempo total: {tiempo_total} segundos")
+            enviar_mensaje(CHAT_ID, f"✅ Instrucción ejecutada:\n{texto}\n\n📄 Resultado:\n{resultado_ia}\n⏱ Tiempo total: {tiempo_total}s")
         except Exception as e:
-            enviar_mensaje(CHAT_ID, f"❌ Error ejecutando instrucción: {e}")
-
+            enviar_mensaje(CHAT_ID,f"❌ Error: {e}")
     return "ok"
 
 # ================== HOME ==================
 @app.route("/")
 def home():
-    return "Sistema activo"
+    return "Sistema IA Contable Activo"
 
-# ================== INICIO HILO ==================
+# ================== HILO MONITOREO ==================
 hilo = threading.Thread(target=revisar_drive)
 hilo.daemon = True
 hilo.start()
 
 # ================== INICIO SERVIDOR ==================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))  # Render asigna PORT automáticamente
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT",10000))
+    app.run(host="0.0.0.0",port=port)

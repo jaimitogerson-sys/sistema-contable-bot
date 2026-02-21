@@ -16,3 +16,4 @@ PyPDF2
 pytesseract
 Pillow
 pdf2image 
+google-cloud-vision

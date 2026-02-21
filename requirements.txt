@@ -5,9 +5,14 @@ google-auth
 google-auth-oauthlib
 google-auth-httplib2
 pandas
-openpyxl
 gunicorn
 pdfplumber
 python-docx
 openpyxl
 psycopg2-binary
+openai
+python-docx
+PyPDF2
+pytesseract
+Pillow
+pdf2image 

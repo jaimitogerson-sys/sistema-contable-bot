@@ -17,4 +17,5 @@ Pillow
 pdf2image
 google-cloud-vision
 PyMuPDF
-python-pptx
+docx2txt
+python-pptx 

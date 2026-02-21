@@ -18,3 +18,4 @@ Pillow
 pdf2image 
 google-cloud-vision
 PyMuPDF
+Pillow

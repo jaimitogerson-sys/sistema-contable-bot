@@ -21,3 +21,4 @@ PyMuPDF
 Pillow
 pytesseract
 python-pptx
+pip

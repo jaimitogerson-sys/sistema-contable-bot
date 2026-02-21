@@ -8,19 +8,25 @@ from datetime import datetime, timedelta
 from flask import Flask, request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-import pandas as pd
 
 app = Flask(__name__)
 
-# ================= VARIABLES =================
+# ================== VARIABLES ==================
 TOKEN = os.getenv("TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-FOLDER_ID = os.getenv("FOLDER_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 GOOGLE_CREDENTIALS = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# ================= DB =================
+# ================== TELEGRAM ==================
+def enviar_mensaje(chat_id, texto):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    data = {
+        "chat_id": chat_id,
+        "text": texto,
+        "parse_mode": "Markdown"
+    }
+    requests.post(url, data=data)
+
+# ================== BASE DE DATOS ==================
 def get_db():
     return psycopg2.connect(DATABASE_URL)
 
@@ -31,6 +37,7 @@ def crear_tablas():
         CREATE TABLE IF NOT EXISTS clientes (
             id SERIAL PRIMARY KEY,
             chat_id TEXT UNIQUE,
+            folder_id TEXT,
             estado TEXT DEFAULT 'ACTIVO',
             vencimiento DATE
         );
@@ -41,40 +48,27 @@ def crear_tablas():
 
 crear_tablas()
 
-# ================= TELEGRAM =================
-def enviar_mensaje(texto):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    data = {
-        "chat_id": CHAT_ID,
-        "text": texto,
-        "parse_mode": "Markdown"
-    }
-    requests.post(url, data=data)
-
-# ================= GOOGLE DRIVE =================
+# ================== GOOGLE DRIVE ==================
 creds = service_account.Credentials.from_service_account_info(
     GOOGLE_CREDENTIALS,
     scopes=["https://www.googleapis.com/auth/drive"]
 )
 drive_service = build("drive", "v3", credentials=creds)
 
-archivos_vistos = set()
-archivos_pendientes = []
-instruccion_pendiente = None
-esperando_confirmacion = False
+archivos_vistos = {}
 
-# ================= ESTADO CLIENTE =================
-def verificar_estado():
+# ================== VERIFICAR CLIENTE ==================
+def verificar_estado(chat_id):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT estado, vencimiento FROM clientes WHERE chat_id = %s", (CHAT_ID,))
+    cur.execute("SELECT estado, vencimiento FROM clientes WHERE chat_id=%s", (chat_id,))
     resultado = cur.fetchone()
 
     if not resultado:
         vencimiento = datetime.now().date() + timedelta(days=30)
         cur.execute(
-            "INSERT INTO clientes (chat_id, estado, vencimiento) VALUES (%s, %s, %s)",
-            (CHAT_ID, "ACTIVO", vencimiento)
+            "INSERT INTO clientes (chat_id, vencimiento) VALUES (%s, %s)",
+            (chat_id, vencimiento)
         )
         conn.commit()
         cur.close()
@@ -86,9 +80,9 @@ def verificar_estado():
 
     if estado != "ACTIVO" or hoy > vencimiento:
         enviar_mensaje(
+            chat_id,
             "🚫 *SERVICIO SUSPENDIDO*\n\n"
             "Tu licencia ha vencido.\n"
-            "💳 Realiza tu pago para reactivar.\n"
             "👉 [Pagar ahora](https://tulinkdepago.com)"
         )
         cur.close()
@@ -99,59 +93,93 @@ def verificar_estado():
     conn.close()
     return True
 
-# ================= AGENTE IA =================
-def ejecutar_agente(archivos, instruccion):
-    inicio = time.time()
-    os.makedirs("./resultados", exist_ok=True)
-
-    datos = []
-    for archivo in archivos:
-        datos.append({
-            "Archivo": archivo["name"],
-            "Procesado": "Sí",
-            "Fecha": datetime.now()
-        })
-
-    df = pd.DataFrame(datos)
-    ruta = f"./resultados/Resultado_{int(time.time())}.xlsx"
-    df.to_excel(ruta, index=False)
-
-    tiempo_total = round(time.time() - inicio, 2)
-
-    enviar_mensaje(
-        f"✅ *FINALIZADO*\n\n"
-        f"⏱ Tiempo total: {tiempo_total} segundos\n"
-        f"📁 Ubicación: {ruta}"
+# ================== DRIVE FUNCIONES ==================
+def buscar_carpeta(nombre, parent_id):
+    query = (
+        f"mimeType='application/vnd.google-apps.folder' "
+        f"and name='{nombre}' "
+        f"and '{parent_id}' in parents "
+        f"and trashed=false"
     )
+    resultado = drive_service.files().list(
+        q=query,
+        fields="files(id, name)"
+    ).execute()
 
-# ================= MONITOREO DRIVE =================
-def revisar_drive():
-    global archivos_pendientes
+    carpetas = resultado.get("files", [])
+    return carpetas[0]["id"] if carpetas else None
+
+def crear_carpeta_si_no_existe(nombre, parent_id):
+    carpeta = buscar_carpeta(nombre, parent_id)
+    if carpeta:
+        return carpeta
+
+    metadata = {
+        "name": nombre,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id]
+    }
+
+    carpeta = drive_service.files().create(
+        body=metadata,
+        fields="id"
+    ).execute()
+
+    return carpeta["id"]
+
+def crear_estructura_carpetas(ruta, folder_base):
+    partes = ruta.split("/")
+    parent_actual = folder_base
+
+    for nombre in partes:
+        parent_actual = crear_carpeta_si_no_existe(nombre, parent_actual)
+
+    return parent_actual
+
+def mover_archivo(file_id, carpeta_destino):
+    archivo = drive_service.files().get(
+        fileId=file_id,
+        fields="parents"
+    ).execute()
+
+    padres_anteriores = ",".join(archivo.get("parents"))
+
+    drive_service.files().update(
+        fileId=file_id,
+        addParents=carpeta_destino,
+        removeParents=padres_anteriores,
+        fields="id, parents"
+    ).execute()
+
+# ================== MONITOREO ==================
+def revisar_drive_cliente(chat_id, folder_id):
+    if chat_id not in archivos_vistos:
+        archivos_vistos[chat_id] = set()
 
     while True:
         try:
-            if not verificar_estado():
+            if not verificar_estado(chat_id):
                 time.sleep(60)
                 continue
 
             resultados = drive_service.files().list(
-                q=f"'{FOLDER_ID}' in parents",
+                q=f"'{folder_id}' in parents and trashed=false",
                 fields="files(id, name)"
             ).execute()
 
             archivos = resultados.get("files", [])
-            nuevos = [a for a in archivos if a["id"] not in archivos_vistos]
+            nuevos = [a for a in archivos if a["id"] not in archivos_vistos[chat_id]]
 
             if nuevos:
-                archivos_pendientes = nuevos
                 for a in nuevos:
-                    archivos_vistos.add(a["id"])
+                    archivos_vistos[chat_id].add(a["id"])
 
-                lista_nombres = "\n".join([f"📄 {a['name']}" for a in nuevos])
+                nombres = "\n".join([f"📄 {a['name']}" for a in nuevos])
 
                 enviar_mensaje(
+                    chat_id,
                     f"📥 *NUEVO ARCHIVO DETECTADO*\n\n"
-                    f"{lista_nombres}\n\n"
+                    f"{nombres}\n\n"
                     f"📂 Total: {len(nuevos)} archivo(s)\n\n"
                     f"🤖 ¿Qué deseas que haga con estos archivos?"
                 )
@@ -162,48 +190,77 @@ def revisar_drive():
             print("Error:", e)
             time.sleep(30)
 
-# ================= WEBHOOK TELEGRAM =================
-@app.route("/telegram_webhook", methods=["POST"])
+# ================== WEBHOOK TELEGRAM ==================
+@app.route(f"/{TOKEN}", methods=["POST"])
 def telegram_webhook():
-    global instruccion_pendiente, esperando_confirmacion
-
     data = request.json
-    mensaje = data.get("message", {}).get("text", "").strip().upper()
 
-    if not archivos_pendientes:
-        return "ok"
+    if "message" in data:
+        chat_id = str(data["message"]["chat"]["id"])
+        texto = data["message"].get("text", "")
 
-    if not esperando_confirmacion:
-        instruccion_pendiente = mensaje
-        esperando_confirmacion = True
+        if not verificar_estado(chat_id):
+            return "ok"
 
-        enviar_mensaje(
-            f"🧠 Entendí que deseas:\n\n"
-            f"\"{mensaje}\"\n\n"
-            f"⚠️ ¿Confirmas que ejecute esta instrucción?\n"
-            f"Responde: SI o NO"
-        )
-        return "ok"
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT folder_id FROM clientes WHERE chat_id=%s", (chat_id,))
+        resultado = cur.fetchone()
+        cur.close()
+        conn.close()
 
-    if esperando_confirmacion:
-        if mensaje == "SI":
-            enviar_mensaje("🚀 Ejecutando instrucción...")
-            ejecutar_agente(archivos_pendientes, instruccion_pendiente)
+        if not resultado or not resultado[0]:
+            enviar_mensaje(chat_id, "⚠ No tienes carpeta Drive vinculada.")
+            return "ok"
 
-        else:
-            enviar_mensaje("❌ Instrucción cancelada.")
+        folder_id = resultado[0]
 
-        esperando_confirmacion = False
-        return "ok"
+        inicio = time.time()
 
-# ================= INICIO =================
-hilo = threading.Thread(target=revisar_drive)
-hilo.daemon = True
-hilo.start()
+        # Detectar ruta tipo: crear carpeta Facturas/2026/Enero
+        if "crear carpeta" in texto.lower():
+            ruta = texto.lower().replace("crear carpeta", "").strip()
+            crear_estructura_carpetas(ruta, folder_id)
 
+            tiempo = round(time.time() - inicio, 2)
+
+            enviar_mensaje(
+                chat_id,
+                f"✅ *FINALIZADO*\n\n"
+                f"📁 Carpeta creada: {ruta}\n"
+                f"⏱ Tiempo: {tiempo} segundos"
+            )
+
+    return "ok"
+
+# ================== WEBHOOK PAGO ==================
+@app.route("/pago_webhook", methods=["POST"])
+def pago_webhook():
+    data = request.json
+    chat_id = data.get("chat_id")
+    nuevo_vencimiento = data.get("nuevo_vencimiento")
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE clientes SET estado='ACTIVO', vencimiento=%s WHERE chat_id=%s",
+        (nuevo_vencimiento, chat_id)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    enviar_mensaje(
+        chat_id,
+        "💳 *PAGO CONFIRMADO*\n🔓 Servicio reactivado."
+    )
+
+    return "ok"
+
+# ================== HOME ==================
 @app.route("/")
 def home():
-    return "Sistema inteligente activo"
+    return "Sistema activo"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)

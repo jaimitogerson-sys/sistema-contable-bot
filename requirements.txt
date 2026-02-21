@@ -11,14 +11,10 @@ python-docx
 openpyxl
 psycopg2-binary
 openai
-python-docx
 PyPDF2
 pytesseract
 Pillow
-pdf2image 
+pdf2image
 google-cloud-vision
 PyMuPDF
-Pillow
-pytesseract
 python-pptx
-pip

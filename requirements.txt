@@ -18,4 +18,4 @@ pdf2image
 google-cloud-vision
 PyMuPDF
 docx2txt
-python-pptx 
+python-pptx

@@ -12,19 +12,15 @@ import pandas as pd
 
 app = Flask(__name__)
 
-# ================== VARIABLES ==================
+# ================= VARIABLES =================
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 FOLDER_ID = os.getenv("FOLDER_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 GOOGLE_CREDENTIALS = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# ================== VARIABLES GLOBALES ==================
-archivos_vistos = set()
-archivos_pendientes = []
-instruccion_pendiente = None
-
-# ================== CONEXIÓN DB ==================
+# ================= DB =================
 def get_db():
     return psycopg2.connect(DATABASE_URL)
 
@@ -45,7 +41,7 @@ def crear_tablas():
 
 crear_tablas()
 
-# ================== MENSAJES ==================
+# ================= TELEGRAM =================
 def enviar_mensaje(texto):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     data = {
@@ -55,14 +51,19 @@ def enviar_mensaje(texto):
     }
     requests.post(url, data=data)
 
-# ================== GOOGLE DRIVE ==================
+# ================= GOOGLE DRIVE =================
 creds = service_account.Credentials.from_service_account_info(
     GOOGLE_CREDENTIALS,
     scopes=["https://www.googleapis.com/auth/drive"]
 )
 drive_service = build("drive", "v3", credentials=creds)
 
-# ================== VERIFICAR ESTADO CLIENTE ==================
+archivos_vistos = set()
+archivos_pendientes = []
+instruccion_pendiente = None
+esperando_confirmacion = False
+
+# ================= ESTADO CLIENTE =================
 def verificar_estado():
     conn = get_db()
     cur = conn.cursor()
@@ -87,7 +88,8 @@ def verificar_estado():
         enviar_mensaje(
             "🚫 *SERVICIO SUSPENDIDO*\n\n"
             "Tu licencia ha vencido.\n"
-            "💳 Realiza tu pago para reactivar."
+            "💳 Realiza tu pago para reactivar.\n"
+            "👉 [Pagar ahora](https://tulinkdepago.com)"
         )
         cur.close()
         conn.close()
@@ -97,8 +99,8 @@ def verificar_estado():
     conn.close()
     return True
 
-# ================== AGENTE PROCESADOR ==================
-def agente_procesador(archivos, instruccion):
+# ================= AGENTE IA =================
+def ejecutar_agente(archivos, instruccion):
     inicio = time.time()
     os.makedirs("./resultados", exist_ok=True)
 
@@ -106,7 +108,6 @@ def agente_procesador(archivos, instruccion):
     for archivo in archivos:
         datos.append({
             "Archivo": archivo["name"],
-            "Instrucción": instruccion,
             "Procesado": "Sí",
             "Fecha": datetime.now()
         })
@@ -117,30 +118,13 @@ def agente_procesador(archivos, instruccion):
 
     tiempo_total = round(time.time() - inicio, 2)
 
-    return ruta, tiempo_total
-
-# ================== EJECUTAR PROCESO ==================
-def ejecutar_proceso():
-    global archivos_pendientes
-    global instruccion_pendiente
-
-    enviar_mensaje("🚀 Ejecutando instrucción...")
-
-    ruta, tiempo_total = agente_procesador(
-        archivos_pendientes,
-        instruccion_pendiente
-    )
-
     enviar_mensaje(
         f"✅ *FINALIZADO*\n\n"
         f"⏱ Tiempo total: {tiempo_total} segundos\n"
         f"📁 Ubicación: {ruta}"
     )
 
-    archivos_pendientes = []
-    instruccion_pendiente = None
-
-# ================== MONITOREO DRIVE ==================
+# ================= MONITOREO DRIVE =================
 def revisar_drive():
     global archivos_pendientes
 
@@ -152,23 +136,22 @@ def revisar_drive():
 
             resultados = drive_service.files().list(
                 q=f"'{FOLDER_ID}' in parents",
-                fields="files(id, name, createdTime)"
+                fields="files(id, name)"
             ).execute()
 
             archivos = resultados.get("files", [])
             nuevos = [a for a in archivos if a["id"] not in archivos_vistos]
 
             if nuevos:
+                archivos_pendientes = nuevos
                 for a in nuevos:
                     archivos_vistos.add(a["id"])
 
-                archivos_pendientes = nuevos
-
-                nombres = "\n".join([f"📄 {a['name']}" for a in nuevos])
+                lista_nombres = "\n".join([f"📄 {a['name']}" for a in nuevos])
 
                 enviar_mensaje(
                     f"📥 *NUEVO ARCHIVO DETECTADO*\n\n"
-                    f"{nombres}\n\n"
+                    f"{lista_nombres}\n\n"
                     f"📂 Total: {len(nuevos)} archivo(s)\n\n"
                     f"🤖 ¿Qué deseas que haga con estos archivos?"
                 )
@@ -179,43 +162,48 @@ def revisar_drive():
             print("Error:", e)
             time.sleep(30)
 
-# ================== WEBHOOK TELEGRAM ==================
-@app.route(f"/webhook/{TOKEN}", methods=["POST"])
+# ================= WEBHOOK TELEGRAM =================
+@app.route("/telegram_webhook", methods=["POST"])
 def telegram_webhook():
-    global instruccion_pendiente
+    global instruccion_pendiente, esperando_confirmacion
 
     data = request.json
+    mensaje = data.get("message", {}).get("text", "").strip().upper()
 
-    if "message" in data:
-        texto = data["message"].get("text", "")
+    if not archivos_pendientes:
+        return "ok"
 
-        if texto.lower() in ["si", "confirmar", "confirmo"]:
-            if archivos_pendientes:
-                ejecutar_proceso()
-            return "ok"
+    if not esperando_confirmacion:
+        instruccion_pendiente = mensaje
+        esperando_confirmacion = True
 
-        if archivos_pendientes:
-            instruccion_pendiente = texto
-            enviar_mensaje(
-                f"⚠️ Vas a ejecutar:\n\n"
-                f"📝 {texto}\n\n"
-                f"📂 Sobre {len(archivos_pendientes)} archivo(s)\n\n"
-                f"Escribe *SI* para confirmar."
-            )
+        enviar_mensaje(
+            f"🧠 Entendí que deseas:\n\n"
+            f"\"{mensaje}\"\n\n"
+            f"⚠️ ¿Confirmas que ejecute esta instrucción?\n"
+            f"Responde: SI o NO"
+        )
+        return "ok"
+
+    if esperando_confirmacion:
+        if mensaje == "SI":
+            enviar_mensaje("🚀 Ejecutando instrucción...")
+            ejecutar_agente(archivos_pendientes, instruccion_pendiente)
+
         else:
-            enviar_mensaje("No hay archivos pendientes.")
+            enviar_mensaje("❌ Instrucción cancelada.")
 
-    return "ok"
+        esperando_confirmacion = False
+        return "ok"
 
-# ================== RUTA PRINCIPAL ==================
-@app.route("/")
-def home():
-    return "Sistema activo"
-
-# ================== INICIAR HILO ==================
+# ================= INICIO =================
 hilo = threading.Thread(target=revisar_drive)
 hilo.daemon = True
 hilo.start()
+
+@app.route("/")
+def home():
+    return "Sistema inteligente activo"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)

@@ -8,7 +8,7 @@ from flask import Flask, request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 import pandas as pd
-import fitz  # PyMuPDF para PDF
+import fitz  # PyMuPDF
 import docx2txt
 import pytesseract
 from PIL import Image
@@ -23,6 +23,10 @@ TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 FOLDER_ID = os.getenv("FOLDER_ID")
 GOOGLE_CREDENTIALS = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+DESCARGA_FOLDER = "descargas"
+RESULTADOS_FOLDER = "resultados"
+os.makedirs(DESCARGA_FOLDER, exist_ok=True)
+os.makedirs(RESULTADOS_FOLDER, exist_ok=True)
 
 # ================== TELEGRAM ==================
 def enviar_mensaje(chat_id, texto):
@@ -36,6 +40,20 @@ creds = service_account.Credentials.from_service_account_info(
 )
 drive_service = build("drive", "v3", credentials=creds)
 archivos_vistos = set()
+
+# ================== DESCARGAR ARCHIVO ==================
+def descargar_archivo(file_id, nombre_local=None):
+    if not nombre_local:
+        nombre_local = os.path.join(DESCARGA_FOLDER, f"{file_id}")
+    request_drive = drive_service.files().get_media(fileId=file_id)
+    from googleapiclient.http import MediaIoBaseDownload
+    import io
+    fh = io.FileIO(nombre_local, 'wb')
+    downloader = MediaIoBaseDownload(fh, request_drive)
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+    return nombre_local
 
 # ================== LECTURA DE ARCHIVOS ==================
 def leer_excel(file_path):
@@ -97,6 +115,23 @@ def mover_archivo(file_id, carpeta_destino):
     padres_anteriores = ",".join(archivo.get("parents"))
     drive_service.files().update(fileId=file_id, addParents=carpeta_destino, removeParents=padres_anteriores, fields="id, parents").execute()
 
+# ================== GENERAR PRESENTACION ==================
+def generar_presentacion(resumen, path=os.path.join(RESULTADOS_FOLDER,"presentacion.pptx")):
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    title = slide.shapes.title
+    title.text = "Resumen General"
+    left, top, width, height = Inches(0.5), Inches(1.5), Inches(9), Inches(5)
+    txBox = slide.shapes.add_textbox(left, top, width, height)
+    tf = txBox.text_frame
+    for r in resumen:
+        p = tf.add_paragraph()
+        p.text = str(r)
+        p.font.size = Pt(14)
+        p.alignment = PP_ALIGN.LEFT
+    prs.save(path)
+    return path
+
 # ================== MONITOREO DRIVE ==================
 def revisar_drive():
     global archivos_vistos
@@ -119,24 +154,7 @@ def revisar_drive():
             print("Error revisando Drive:", e)
             time.sleep(30)
 
-# ================== GENERAR PRESENTACION ==================
-def generar_presentacion(resumen, path="resultados/presentacion.pptx"):
-    prs = Presentation()
-    slide = prs.slides.add_slide(prs.slide_layouts[5])
-    title = slide.shapes.title
-    title.text = "Resumen General"
-    left, top, width, height = Inches(0.5), Inches(1.5), Inches(9), Inches(5)
-    txBox = slide.shapes.add_textbox(left, top, width, height)
-    tf = txBox.text_frame
-    for r in resumen:
-        p = tf.add_paragraph()
-        p.text = str(r)
-        p.font.size = Pt(14)
-        p.alignment = PP_ALIGN.LEFT
-    prs.save(path)
-    return path
-
-# ================== EJECUTAR INSTRUCCION ==================
+# ================== TELEGRAM WEBHOOK ==================
 @app.route(f"/{TOKEN}", methods=["POST"])
 def telegram_webhook():
     data = request.json
@@ -155,16 +173,17 @@ def telegram_webhook():
                 enviar_mensaje(CHAT_ID, f"✅ *FINALIZADO*\n📁 Carpeta creada: {ruta}\n⏱ Tiempo: {tiempo} segundos")
                 return "ok"
 
-            # Analizar archivos y ejecutar instrucción libre
+            # Procesar archivos según instrucción libre
             resultados = []
             for a_id in archivos_vistos:
                 file_meta = drive_service.files().get(fileId=a_id, fields="name").execute()
-                file_name = file_meta["name"]
-                resultados.append((file_name, extraer_datos(file_name)))
+                file_name_drive = file_meta["name"]
+                file_local = descargar_archivo(a_id, os.path.join(DESCARGA_FOLDER,file_name_drive))
+                datos = extraer_datos(file_local)
+                resultados.append((file_name_drive, datos))
 
-            # Generar Excel
-            os.makedirs("resultados", exist_ok=True)
-            path_excel = "resultados/resultado_final.xlsx"
+            # Guardar Excel final
+            path_excel = os.path.join(RESULTADOS_FOLDER,"resultado_final.xlsx")
             with pd.ExcelWriter(path_excel) as writer:
                 for f,d in resultados:
                     if isinstance(d,pd.DataFrame):
